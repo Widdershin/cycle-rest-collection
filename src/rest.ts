@@ -2,6 +2,44 @@ import xs from 'xstream';
 import concat from 'xstream/extra/concat';
 import isolate from '@cycle/isolate';
 
+function always (stream) {
+  return xs.create({
+    start (listener) {
+      stream.addListener({
+        next (ev) {
+          listener.next(ev);
+        }
+      })
+    },
+
+    stop () {}
+  });
+}
+
+function memoize (f, remember = true) {
+  return function (selector) {
+    const cache = {};
+
+    function sink (item) {
+      if (item._id in cache) {
+        return cache[item._id];
+      }
+
+      let stream = selector(item);
+
+      if (remember) {
+        stream = stream.remember();
+      }
+
+      cache[item._id] = stream;
+
+      return stream;
+    }
+
+    return f(sink);
+  }
+}
+
 function loadComponent (state, componentData) {
   const componentState$ = componentData.state$;
   let id = componentData.id;
@@ -39,7 +77,7 @@ function loadComponentsFromIndex (data) {
 
 function addComponent (componentData) {
   return function reduce (state) {
-    return loadComponent(state, componentData);
+    return loadComponent(state, {...componentData, state$: xs.merge(componentData.state$, xs.never())});
   }
 }
 
@@ -47,7 +85,7 @@ function applyReducer (state, reducer) {
   return reducer(state);
 }
 
-function createRequest (endpoint) {
+function createRequest (endpoint, name) {
   return function (data) {
     const dataToSend = {};
 
@@ -57,7 +95,8 @@ function createRequest (endpoint) {
       method: 'POST',
       url: endpoint,
       tempId: data.tempId,
-      send: JSON.stringify(dataToSend)
+      send: JSON.stringify({[name]: dataToSend}),
+      category: 'create'
     }
   }
 }
@@ -67,7 +106,7 @@ function createSuccess (data) {
 
     const stateSource = state.stateSources[data.tempIdToUpdate];
 
-    stateSource.shamefullySendNext(data.items);
+    stateSource.shamefullySendNext(data.body);
 
     delete state.stateSources[data.tempIdToUpdate];
 
@@ -75,7 +114,7 @@ function createSuccess (data) {
       ...state,
 
       stateSources: {
-        [data.items.id]: stateSource
+        [data.body.id]: stateSource
       },
 
       items: state.items
@@ -83,12 +122,13 @@ function createSuccess (data) {
   }
 }
 
-function updateRequest (endpoint) {
+function updateRequest (endpoint, name) {
   return function (data) {
     return {
       url: `${endpoint}/${data.id}`,
       method: 'PUT',
-      send: JSON.stringify(data)
+      send: JSON.stringify({[name]: data}),
+      category: 'update'
     }
   }
 }
@@ -128,7 +168,8 @@ function RestCollection (component, sources, endpoint) {
   });
 
   const initialRequest = {
-    url: endpoint
+    url: endpoint,
+    category: 'index'
   }
 
   const initialState = {
@@ -138,7 +179,7 @@ function RestCollection (component, sources, endpoint) {
     stateSources: {}
   };
 
-  const index$ = sources.HTTP.select('index').flatten().map(a => a.items);
+  const index$ = sources.HTTP.select('index').flatten().map(response => response.body);
   const loadComponentsFromIndex$ = index$.map(loadComponentsFromIndex);
 
   const createSuccess$ = sources.HTTP.select('create').map(response$ => {
@@ -153,51 +194,49 @@ function RestCollection (component, sources, endpoint) {
 
   const reducer$ = xs.merge(
     loadComponentsFromIndex$,
-    addLocalComponent$,
+    addLocalComponent$.debug('hi'),
     createSuccess$
   );
 
   const state$ = reducer$.fold(applyReducer, initialState);
-  const items$ = state$.map(state => state.items);
+  const items$ = state$.map(state => state.items).debug('components');
 
-  function merge (selector) {
-    const stuff = {};
-
-    function sink (item) {
-      if (item._id in stuff) {
-        return stuff[item._id];
-      }
-
-      const stream = selector(item);
-
-      stuff[item._id] = stream;
-
-      return stream;
-    }
-
+  const merge = memoize(function (selector) {
     return items$
-      .map(items => items.map(sink))
+      .map(items => items.map(selector))
       .map(streams => xs.merge(...streams))
       .flatten();
-  }
+  }, false);
+
+  const pluck = memoize(function (selector) {
+    return items$
+      .map(items => items.map(selector))
+      .map(selectedItems => xs.combine(...selectedItems))
+      .flatten();
+  });
+
+  const update$ = merge(item =>
+    item.state$
+      .drop(1)
+      .compose(sources.Time.debounce(300))
+      .map(updateRequest(endpoint, component.name.toLowerCase()))
+  )
 
   const request$ = xs.merge(
     xs.of(initialRequest),
 
-    merge(component => component.state$.drop(1)).map(updateRequest(endpoint)),
+    update$,
 
-    addWithTemporaryId$.map(add => add.state$.take(1)).flatten().map(createRequest(endpoint))
+    addWithTemporaryId$
+      .map(add => add.state$.take(1))
+      .flatten()
+      .map(createRequest(endpoint, component.name.toLowerCase()))
   );
 
   return {
-    HTTP: request$,
-
-    pluck (selector) {
-      return items$
-        .map(items => items.map(selector))
-        .map(selectedItems => xs.combine(...selectedItems))
-        .flatten();
-    }
+    HTTP: request$.map(req => ({...req, type: 'application/json'})),
+    pluck,
+    merge
   }
 }
 
